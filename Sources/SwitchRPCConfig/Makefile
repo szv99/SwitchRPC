@@ -45,7 +45,7 @@ INCLUDES	  :=	include
 #ROMFS	      :=	romfs
 APP_TITLE	  :=	SwitchRPCConfig
 APP_AUTHOR  :=	llsc12
-APP_VERSION :=	0.1.0
+APP_VERSION :=	0.2.0
 
 #---------------------------------------------------------------------------------
 # options for code generation
