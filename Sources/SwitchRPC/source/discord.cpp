@@ -3,10 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <string>
 #include <vector>
+#include <utility>
 #include <time.h>
-#include <fstream>
 
 #include <switch.h>
 #include <json-c/json.h>
@@ -18,66 +19,26 @@
 
 const char* clientId = "1249119754522857616";
 
-#define PROFILES_PATH     "sdmc:/config/switchrpc_profiles.json"
-#define LEGACY_TOKEN_PATH "sdmc:/config/switchrpc_token"
-#define SESSIONS_PATH     "sdmc:/config/switchrpc_sessions.json"
+#define PROFILES_PATH        "sdmc:/config/switchrpc_profiles.json"
+#define LEGACY_TOKEN_PATH    "sdmc:/config/switchrpc_token"
+#define SESSIONS_PATH        "sdmc:/config/switchrpc_sessions.json"
 #define LEGACY_SESSIONS_PATH "sdmc:/config/switchrpc_sessions"
 
-// Global link table. Pointers returned by resolveLink() remain valid until the
-// next loadLinks() call (which clears/rebuilds this vector). Callers must not
-// hold a pointer across a loadLinks() call.
+// where the links came from, so we can tell when the config app changes them
+struct LinkSource {
+    bool legacy = false;   // true = single token in switchrpc_token, no profiles.json yet
+    std::string contents;
+
+    bool operator==(const LinkSource& other) const {
+        return legacy == other.legacy && contents == other.contents;
+    }
+};
+
 static std::vector<Link> g_links;
-// true when the links were loaded from the legacy switchrpc_token file (so
-// rotated tokens are written back to that file instead of profiles.json).
-static bool g_legacyMode = false;
+static LinkSource g_linkSource;
 
 // ------------------------------------------------------------------
-// small file helpers
-// ------------------------------------------------------------------
-
-static bool readFileContents(const char* path, std::string& out) {
-    std::ifstream file(path);
-    if (!file.is_open()) return false;
-    out.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    file.close();
-    return true;
-}
-
-static void stripTrailingNewlines(std::string& s) {
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
-        s.pop_back();
-    }
-}
-
-// Write data to path via a temp file + rename so a crash mid-write cannot leave
-// a half-written (corrupt) file. Falls back to a direct write if the rename
-// path fails, so data is never lost.
-static void writeFileAtomic(const char* path, const char* data) {
-    std::string tmp = std::string(path) + ".tmp";
-
-    {
-        std::ofstream out(tmp, std::ios::trunc);
-        if (!out.is_open()) {
-            std::ofstream direct(path, std::ios::trunc);
-            if (direct.is_open()) direct << data;
-            return;
-        }
-        out << data;
-        out.close();
-    }
-
-    // FAT/fsdev rename fails if the destination exists, so remove it first.
-    remove(path);
-    if (rename(tmp.c_str(), path) != 0) {
-        // rename failed: fall back to a direct write so the data isn't lost.
-        std::ofstream direct(path, std::ios::trunc);
-        if (direct.is_open()) direct << data;
-        remove(tmp.c_str());
-    }
-}
-
-// ------------------------------------------------------------------
-// switch_uid serialization
+// switch_uid strings
 // ------------------------------------------------------------------
 
 std::string accountUidToString(const AccountUid& uid) {
@@ -88,260 +49,214 @@ std::string accountUidToString(const AccountUid& uid) {
 }
 
 bool accountUidFromString(const std::string& s, AccountUid& out) {
-    out.uid[0] = 0;
-    out.uid[1] = 0;
+    out = {};
     size_t dash = s.find('-');
-    if (dash == std::string::npos) return false;
-    std::string a = s.substr(0, dash);
-    std::string b = s.substr(dash + 1);
-    if (a.empty() || b.empty()) return false;
-    out.uid[0] = (u64)strtoull(a.c_str(), NULL, 16);
-    out.uid[1] = (u64)strtoull(b.c_str(), NULL, 16);
+    if (dash == 0 || dash == std::string::npos || dash + 1 >= s.size()) return false;
+    out.uid[0] = strtoull(s.substr(0, dash).c_str(), NULL, 16);
+    out.uid[1] = strtoull(s.substr(dash + 1).c_str(), NULL, 16);
     return true;
 }
 
-static bool uidIsZero(const AccountUid& uid) {
-    return uid.uid[0] == 0 && uid.uid[1] == 0;
-}
-
 // ------------------------------------------------------------------
-// loadLinks / resolveLink
+// links
 // ------------------------------------------------------------------
 
-// helper: read a string member of a json object into dst (leaves dst unchanged
-// if missing). Copies into std::string so it is safe after json_object_put.
-static void getJsonString(json_object* obj, const char* key, std::string& dst) {
-    json_object* v;
-    if (json_object_object_get_ex(obj, key, &v)) {
-        const char* s = json_object_get_string(v);
-        if (s != NULL) dst.assign(s);
-    }
+static LinkSource readLinkSource() {
+    LinkSource source;
+    // once profiles.json exists it's the only source of truth, even if it's empty.
+    // the config app migrates the legacy token based on the same rule.
+    if (readFileContents(PROFILES_PATH, source.contents)) return source;
+    if (readFileContents(LEGACY_TOKEN_PATH, source.contents)) source.legacy = true;
+    return source;
 }
 
-static void parseLinksFromJson(json_object* root) {
-    json_object* links_arr;
-    if (!json_object_object_get_ex(root, "links", &links_arr) ||
-        json_object_get_type(links_arr) != json_type_array) {
-        return;
-    }
-
-    int n = json_object_array_length(links_arr);
-    for (int i = 0; i < n; i++) {
-        json_object* doc = json_object_array_get_idx(links_arr, i);
-        if (doc == NULL) continue;
-
-        Link l;
-        getJsonString(doc, "switch_uid", l.switchUidStr);
-        getJsonString(doc, "discord_id", l.discordId);
-        getJsonString(doc, "discord_username", l.discordUsername);
-        getJsonString(doc, "refresh_token", l.refreshToken);
-
-        if (l.switchUidStr.empty()) {
-            // match the config app, which skips entries with no switch_uid rather
-            // than silently promoting them to the default/wildcard link.
-            continue;
-        }
-        accountUidFromString(l.switchUidStr, l.switchUid);
-
-        g_links.push_back(l);
-    }
+static std::string jsonString(json_object* obj, const char* key) {
+    json_object* value;
+    if (!json_object_object_get_ex(obj, key, &value)) return "";
+    const char* s = json_object_get_string(value);
+    return s ? s : "";
 }
 
-std::vector<Link>& loadLinks() {
+static void parseLinks(const LinkSource& source) {
     g_links.clear();
-    g_legacyMode = false;
+    g_linkSource = source;
 
-    // If profiles.json exists at all it is authoritative — never fall back to
-    // the legacy token (the config app migrates based on file existence, so the
-    // two sides must agree). A present-but-empty/unparseable file => zero links.
-    std::string contents;
-    bool profilesExist = readFileContents(PROFILES_PATH, contents);
-    if (profilesExist) {
-        if (!contents.empty()) {
-            json_object* root = json_tokener_parse(contents.c_str());
-            if (root != NULL) {
-                parseLinksFromJson(root);
-                json_object_put(root);
-                writeToLog("[Discord] Loaded %d link(s) from profiles.json", (int)g_links.size());
-            } else {
-                writeToLog("[Discord] profiles.json present but unparseable; treating as zero links.");
-            }
-        } else {
-            writeToLog("[Discord] profiles.json present but empty; treating as zero links.");
-        }
-        return g_links;
-    }
+    if (source.legacy) {
+        std::string token = source.contents;
+        while (!token.empty() && strchr("\r\n\t ", token.back())) token.pop_back();
+        if (token.empty()) return;
 
-    // No profiles.json: legacy fallback — single default/wildcard link backed by
-    // switchrpc_token (rotated tokens are written back to that file).
-    std::string legacy;
-    if (readFileContents(LEGACY_TOKEN_PATH, legacy)) {
-        stripTrailingNewlines(legacy);
-        if (!legacy.empty()) {
-            Link l;
-            l.switchUidStr = "0000000000000000-0000000000000000";
-            accountUidFromString(l.switchUidStr, l.switchUid);
-            l.refreshToken = legacy;
-            g_links.push_back(l);
-            g_legacyMode = true;
-            writeToLog("[Discord] Loaded legacy refresh token as a single default link.");
-            return g_links;
-        }
-    }
-
-    writeToLog("[Discord] No links found (no profiles.json and no legacy token).");
-    return g_links;
-}
-
-Link* resolveLink(const AccountUid& uid) {
-    Link* def = NULL;
-    for (size_t i = 0; i < g_links.size(); i++) {
-        Link& l = g_links[i];
-        if (l.switchUid.uid[0] == uid.uid[0] && l.switchUid.uid[1] == uid.uid[1]) {
-            return &l;
-        }
-        if (uidIsZero(l.switchUid)) {
-            def = &l;
-        }
-    }
-    return def;
-}
-
-// ------------------------------------------------------------------
-// persistence of rotated refresh tokens
-// ------------------------------------------------------------------
-
-void persistLinkRefreshToken(const Link& link) {
-    if (g_legacyMode) {
-        std::ofstream file(LEGACY_TOKEN_PATH, std::ios::trunc);
-        if (!file.is_open()) {
-            writeToLog("[Discord] Failed to open legacy token file for writing!");
-            return;
-        }
-        file << link.refreshToken;
-        file.close();
-        writeToLog("[Discord] Saved rotated refresh token to legacy file.");
+        Link link;
+        link.switchUidStr = accountUidToString(link.switchUid);
+        link.refreshToken = token;
+        g_links.push_back(link);
+        writeToLog("[Discord] Loaded legacy refresh token as the Default link.");
         return;
     }
 
-    // read-modify-write profiles.json, preserving every other entry.
-    std::string contents;
-    readFileContents(PROFILES_PATH, contents);
-
-    json_object* root = contents.empty() ? NULL : json_tokener_parse(contents.c_str());
-    if (root == NULL) {
-        root = json_object_new_object();
-        json_object_object_add(root, "version", json_object_new_int(1));
-    }
-
-    json_object* links_arr;
-    if (!json_object_object_get_ex(root, "links", &links_arr) ||
-        json_object_get_type(links_arr) != json_type_array) {
-        links_arr = json_object_new_array();
-        json_object_object_add(root, "links", links_arr); // root takes ownership
-    }
-
-    bool found = false;
-    int n = json_object_array_length(links_arr);
-    for (int i = 0; i < n; i++) {
-        json_object* doc = json_object_array_get_idx(links_arr, i);
-        if (doc == NULL) continue;
-        json_object* juid;
-        if (json_object_object_get_ex(doc, "switch_uid", &juid)) {
-            const char* s = json_object_get_string(juid);
-            if (s != NULL && link.switchUidStr == s) {
-                // object_add replaces existing key, freeing the old value.
-                json_object_object_add(doc, "refresh_token",
-                                       json_object_new_string(link.refreshToken.c_str()));
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if (!found) {
-        // The entry is gone (e.g. the config app unlinked this profile while a
-        // session was active). Do NOT resurrect it — skip persistence.
-        writeToLog("[Discord] Link %s not in profiles.json; not persisting (it may have been unlinked).",
-                   link.switchUidStr.c_str());
+    json_object* root = json_tokener_parse(source.contents.c_str());
+    json_object* arr;
+    if (root == NULL || !json_object_object_get_ex(root, "links", &arr) ||
+        json_object_get_type(arr) != json_type_array) {
+        if (!source.contents.empty()) writeToLog("[Discord] profiles.json is not valid, no links loaded.");
         json_object_put(root);
         return;
     }
 
-    writeFileAtomic(PROFILES_PATH, json_object_to_json_string(root));
-    writeToLog("[Discord] Persisted rotated refresh token to profiles.json for %s",
-               link.switchUidStr.c_str());
+    int n = json_object_array_length(arr);
+    for (int i = 0; i < n; i++) {
+        json_object* entry = json_object_array_get_idx(arr, i);
+        Link link;
+        link.switchUidStr = jsonString(entry, "switch_uid");
+        link.discordId = jsonString(entry, "discord_id");
+        link.discordUsername = jsonString(entry, "discord_username");
+        link.refreshToken = jsonString(entry, "refresh_token");
+        if (!accountUidFromString(link.switchUidStr, link.switchUid) || link.refreshToken.empty()) continue;
+        g_links.push_back(link);
+    }
+    json_object_put(root);
+    writeToLog("[Discord] Loaded %d link(s) from profiles.json", (int)g_links.size());
+}
 
+void loadLinks() {
+    parseLinks(readLinkSource());
+}
+
+bool reloadLinksIfChanged() {
+    LinkSource source = readLinkSource();
+    if (source == g_linkSource) return false;
+
+    writeToLog("[Discord] Links changed on disk, reloading.");
+    std::vector<Link> previous;
+    previous.swap(g_links);
+    parseLinks(source);
+
+    for (Link& old : previous) {
+        Link* current = findLink(old.switchUidStr);
+        if (current != nullptr && current->refreshToken == old.refreshToken) {
+            current->authToken = old.authToken;
+            current->authTokenExpiry = old.authTokenExpiry;
+            current->sessionToken = old.sessionToken;
+        } else if (!old.sessionToken.empty()) {
+            // unlinked or relinked to another account, the session belongs to the old one
+            discordDeleteHeadlessSession(old);
+        }
+    }
+    return true;
+}
+
+Link* resolveLink(const AccountUid& uid) {
+    Link* fallback = nullptr;
+    for (Link& link : g_links) {
+        if (link.switchUid.uid[0] == uid.uid[0] && link.switchUid.uid[1] == uid.uid[1]) return &link;
+        if (link.switchUid.uid[0] == 0 && link.switchUid.uid[1] == 0) fallback = &link;
+    }
+    return fallback;
+}
+
+Link* findLink(const std::string& switchUidStr) {
+    for (Link& link : g_links) {
+        if (link.switchUidStr == switchUidStr) return &link;
+    }
+    return nullptr;
+}
+
+// Discord rotates the refresh token on every refresh, so the new one has to be
+// saved or the link breaks on the next boot. Only overwrite the entry if it still
+// holds the token we refreshed with - if the user unlinked or relinked the profile
+// in the meantime, the file has the newer state and must win.
+static void persistRotatedRefreshToken(const Link& link, const std::string& oldToken) {
+    LinkSource source = readLinkSource();
+
+    if (source.legacy) {
+        std::string onDisk = source.contents;
+        while (!onDisk.empty() && strchr("\r\n\t ", onDisk.back())) onDisk.pop_back();
+        if (onDisk != oldToken) return;
+        if (writeFileAtomic(LEGACY_TOKEN_PATH, link.refreshToken)) {
+            g_linkSource.contents = link.refreshToken;
+            writeToLog("[Discord] Saved rotated refresh token to legacy file.");
+        }
+        return;
+    }
+
+    json_object* root = json_tokener_parse(source.contents.c_str());
+    json_object* arr;
+    if (root == NULL || !json_object_object_get_ex(root, "links", &arr) ||
+        json_object_get_type(arr) != json_type_array) {
+        json_object_put(root);
+        return;
+    }
+
+    bool updated = false;
+    int n = json_object_array_length(arr);
+    for (int i = 0; i < n; i++) {
+        json_object* entry = json_object_array_get_idx(arr, i);
+        if (jsonString(entry, "switch_uid") != link.switchUidStr) continue;
+        if (jsonString(entry, "refresh_token") == oldToken) {
+            json_object_object_add(entry, "refresh_token", json_object_new_string(link.refreshToken.c_str()));
+            updated = true;
+        }
+        break;
+    }
+
+    if (updated) {
+        std::string contents = json_object_to_json_string(root);
+        if (writeFileAtomic(PROFILES_PATH, contents)) {
+            // our own write, don't treat it as a config change
+            g_linkSource.contents = contents;
+            writeToLog("[Discord] Saved rotated refresh token for %s", link.switchUidStr.c_str());
+        }
+    } else {
+        writeToLog("[Discord] %s was unlinked or relinked, not saving its rotated token.", link.switchUidStr.c_str());
+    }
     json_object_put(root);
 }
 
 // ------------------------------------------------------------------
-// sessions bookkeeping (switchrpc_sessions.json)
+// sessions file
 // ------------------------------------------------------------------
 
-// Upsert (or, when token is empty, remove) the session entry for a given uid in
-// switchrpc_sessions.json. Keeps at most one entry per switch_uid so the file
-// stays bounded (the Switch runs one app at a time). Rebuilds the array rather
-// than relying on json_object_array_del_idx for older json-c compatibility.
-static void upsertSessionEntry(const std::string& uidStr, const std::string& token) {
+// switchrpc_sessions.json keeps one session token per switch_uid, so sessions left
+// behind by a crash or power loss can be deleted on the next boot with the right
+// account's credentials. An empty token removes the entry.
+static void setSessionEntry(const std::string& uidStr, const std::string& token) {
     std::string contents;
     readFileContents(SESSIONS_PATH, contents);
     json_object* oldRoot = contents.empty() ? NULL : json_tokener_parse(contents.c_str());
 
-    json_object* newRoot = json_object_new_object();
-    json_object* newArr = json_object_new_array();
-    json_object_object_add(newRoot, "sessions", newArr); // newRoot takes ownership
+    json_object* root = json_object_new_object();
+    json_object* arr = json_object_new_array();
+    json_object_object_add(root, "sessions", arr);
 
-    if (oldRoot != NULL) {
-        json_object* sessions;
-        if (json_object_object_get_ex(oldRoot, "sessions", &sessions) &&
-            json_object_get_type(sessions) == json_type_array) {
-            int n = json_object_array_length(sessions);
-            for (int i = 0; i < n; i++) {
-                json_object* doc = json_object_array_get_idx(sessions, i);
-                if (doc == NULL) continue;
-                json_object* juid;
-                json_object* jtok;
-                if (!json_object_object_get_ex(doc, "switch_uid", &juid) ||
-                    !json_object_object_get_ex(doc, "token", &jtok)) continue;
-                const char* u = json_object_get_string(juid);
-                const char* t = json_object_get_string(jtok);
-                std::string us = (u != NULL) ? u : "";
-                std::string ts = (t != NULL) ? t : "";
-                if (us == uidStr) continue;       // drop the old entry for this uid
-                if (us.empty() || ts.empty()) continue;
-                json_object* e = json_object_new_object();
-                json_object_object_add(e, "switch_uid", json_object_new_string(us.c_str()));
-                json_object_object_add(e, "token", json_object_new_string(ts.c_str()));
-                json_object_array_add(newArr, e); // newArr takes ownership
-            }
+    json_object* oldArr;
+    if (oldRoot != NULL && json_object_object_get_ex(oldRoot, "sessions", &oldArr) &&
+        json_object_get_type(oldArr) == json_type_array) {
+        int n = json_object_array_length(oldArr);
+        for (int i = 0; i < n; i++) {
+            json_object* entry = json_object_array_get_idx(oldArr, i);
+            if (jsonString(entry, "switch_uid") == uidStr) continue;
+            json_object_array_add(arr, json_object_get(entry));
         }
-        json_object_put(oldRoot);
     }
+    json_object_put(oldRoot);
 
-    // add the updated entry unless this is a removal (empty token)
     if (!token.empty()) {
-        json_object* e = json_object_new_object();
-        json_object_object_add(e, "switch_uid", json_object_new_string(uidStr.c_str()));
-        json_object_object_add(e, "token", json_object_new_string(token.c_str()));
-        json_object_array_add(newArr, e); // newArr takes ownership
+        json_object* entry = json_object_new_object();
+        json_object_object_add(entry, "switch_uid", json_object_new_string(uidStr.c_str()));
+        json_object_object_add(entry, "token", json_object_new_string(token.c_str()));
+        json_object_array_add(arr, entry);
     }
 
-    if (json_object_array_length(newArr) == 0) {
-        // nothing left to track: drop the file entirely
-        remove(SESSIONS_PATH);
-        json_object_put(newRoot);
-        return;
+    if (json_object_array_length(arr) == 0) {
+        removeFileAtomic(SESSIONS_PATH);
+    } else {
+        writeFileAtomic(SESSIONS_PATH, json_object_to_json_string(root));
     }
-
-    writeFileAtomic(SESSIONS_PATH, json_object_to_json_string(newRoot));
-    writeToLog("[Discord] Updated sessions.json for %s", uidStr.c_str());
-
-    json_object_put(newRoot);
+    json_object_put(root);
 }
 
 // ------------------------------------------------------------------
-// curl helpers (unchanged behaviour)
+// requests
 // ------------------------------------------------------------------
 
 int curlDebugCallback(CURL *handle, curl_infotype type, char *data, size_t size, void *userp) {
@@ -369,11 +284,30 @@ int curlDebugCallback(CURL *handle, curl_infotype type, char *data, size_t size,
     return 0;
 }
 
+// learns the console's clock offset from the Date header of every response
+static size_t headerCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
+    (void)userdata;
+    size_t totalSize = size * nitems;
+
+    if (totalSize > 5 && strncasecmp(buffer, "Date:", 5) == 0) {
+        std::string value(buffer + 5, totalSize - 5);
+        while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
+        time_t serverUtc = curl_getdate(value.c_str(), NULL);
+        if (serverUtc != -1) syncTimeWithServer(serverUtc);
+    }
+
+    return totalSize;
+}
+
 // curl helper for easy requests to discord,
-// specify url, method, headers, and body as needed and a pointer to a string to store the response in, and the size of that string.
-bool sendRequest(const char* url, const char* method, struct curl_slist* headers, const char* body, std::string* response) {
+// specify url, method, headers, and body as needed and a pointer to a string to store the response in.
+// takes ownership of headers. httpStatus, if given, receives the HTTP status (0 if there was no response).
+bool sendRequest(const char* url, const char* method, struct curl_slist* headers, const char* body, std::string* response, long* httpStatus = nullptr) {
+    // token requests and responses carry credentials, keep them out of the log on the sd card
+    bool sensitive = strstr(url, "/oauth2/token") != NULL;
+
     writeToLog("[Discord] Sending %s request to %s", method, url);
-    if (body != NULL) {
+    if (body != NULL && !sensitive) {
         writeToLog("[Discord] Request Body: %s", body);
     }
 
@@ -417,6 +351,13 @@ bool sendRequest(const char* url, const char* method, struct curl_slist* headers
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        // don't let a request hang forever - matters for the pre-sleep cleanup,
+        // it shouldn't hold up the console going to sleep
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, NULL);
 
         // temporary fix to failing dns resolution
         struct curl_slist *dns_cache = NULL;
@@ -442,19 +383,20 @@ bool sendRequest(const char* url, const char* method, struct curl_slist* headers
         CURLcode res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
             writeToLog("[Discord] cURL request failed: %s", curl_easy_strerror(res));
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        } else if (response != NULL) {
+            writeToLog("[Discord] cURL request successful. Response length: %zu", response->size());
+            if (!sensitive) writeToLog("[Discord] Response Body: %s", response->c_str());
         } else {
-            if (response != NULL) {
-                writeToLog("[Discord] cURL request successful. Response length: %zu", response->size());
-                writeToLog("[Discord] Response Body: %s", response->c_str());
-            } else {
-                writeToLog("[Discord] cURL request successful. (No response expected)");
-            }
+            writeToLog("[Discord] cURL request successful. (No response expected)");
         }
 
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (httpStatus != NULL) *httpStatus = http_code;
         bool success = (http_code >= 200 && http_code < 300);
+        if (res == CURLE_OK && !success) {
+            writeToLog("[Discord] Request failed with HTTP %ld", http_code);
+        }
 
         curl_slist_free_all(reqHeaders);
         curl_slist_free_all(headers);
@@ -468,35 +410,21 @@ bool sendRequest(const char* url, const char* method, struct curl_slist* headers
     }
 }
 
-// ------------------------------------------------------------------
-// per-link auth
-// ------------------------------------------------------------------
-
-bool refreshAuthTokenIfNeeded(Link& link) {
-    if (link.refreshToken.empty()) {
-        writeToLog("[Discord] Cannot refresh: refresh token is empty for %s", link.switchUidStr.c_str());
-        return false;
-    }
-
-    // still valid (with a 5 minute safety margin)?
-    if (!link.authToken.empty() && time(NULL) < link.authTokenExpiry - 300) {
-        writeToLog("[Discord] Auth token still valid for %s.", link.switchUidStr.c_str());
+static bool refreshAuthTokenIfNeeded(Link& link) {
+    // reuse the token until 5 minutes before it expires
+    if (!link.authToken.empty() && getRawNowSec() + 300 < link.authTokenExpiry) {
         return true;
     }
 
     writeToLog("[Discord] Refreshing auth token for %s...", link.switchUidStr.c_str());
 
-    const char* url = "https://gaming-sdk.com/api/v9/oauth2/token";
-    const char* method = "POST";
     struct curl_slist* headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
-    std::string bodyStr = "grant_type=refresh_token&refresh_token=" + link.refreshToken + "&client_id=" + clientId;
+    std::string body = "grant_type=refresh_token&refresh_token=" + link.refreshToken + "&client_id=" + clientId;
 
-    std::string response = "";
-    bool success = sendRequest(url, method, headers, bodyStr.c_str(), &response);
-
-    if (!success) {
-        writeToLog("[Discord] Failed to send request for auth token refresh!");
+    std::string response;
+    if (!sendRequest("https://gaming-sdk.com/api/v9/oauth2/token", "POST", headers, body.c_str(), &response)) {
+        writeToLog("[Discord] Auth token refresh failed for %s", link.switchUidStr.c_str());
         return false;
     }
 
@@ -506,143 +434,99 @@ bool refreshAuthTokenIfNeeded(Link& link) {
         return false;
     }
 
-    bool rotated = false;
-    json_object* json_auth_token;
-    json_object* json_refresh_token;
+    std::string accessToken = jsonString(json_response, "access_token");
+    std::string refreshToken = jsonString(json_response, "refresh_token");
     json_object* json_expires_in;
-
-    if (json_object_object_get_ex(json_response, "access_token", &json_auth_token)) {
-        const char* s = json_object_get_string(json_auth_token);
-        if (s != NULL) link.authToken.assign(s);
-        writeToLog("[Discord] Extracted new access_token for %s", link.switchUidStr.c_str());
-    }
-    if (json_object_object_get_ex(json_response, "refresh_token", &json_refresh_token)) {
-        const char* s = json_object_get_string(json_refresh_token);
-        if (s != NULL) {
-            link.refreshToken.assign(s);
-            rotated = true;
-        }
-    }
-    if (json_object_object_get_ex(json_response, "expires_in", &json_expires_in)) {
-        link.authTokenExpiry = time(NULL) + json_object_get_int(json_expires_in);
-    }
-
+    int expiresIn = json_object_object_get_ex(json_response, "expires_in", &json_expires_in)
+        ? json_object_get_int(json_expires_in) : 0;
     json_object_put(json_response);
 
-    if (rotated) {
-        persistLinkRefreshToken(link);
+    if (accessToken.empty()) {
+        writeToLog("[Discord] Token refresh response had no access_token for %s", link.switchUidStr.c_str());
+        return false;
     }
+    link.authToken = accessToken;
+    link.authTokenExpiry = getRawNowSec() + expiresIn;
 
-    return !link.authToken.empty();
+    if (!refreshToken.empty() && refreshToken != link.refreshToken) {
+        std::string oldToken = link.refreshToken;
+        link.refreshToken = refreshToken;
+        persistRotatedRefreshToken(link, oldToken);
+    }
+    return true;
 }
 
-bool authenticatedRequest(Link& link, const char* url, const char* method, struct curl_slist* headers, const char* body, std::string* response) {
-    refreshAuthTokenIfNeeded(link);
-
-    if (link.authToken.empty()) {
-        writeToLog("[Discord] WARNING: authenticated request but authToken empty for %s!", link.switchUidStr.c_str());
-        curl_slist_free_all(headers); // sendRequest would have owned/freed these
+// takes ownership of headers, like sendRequest
+static bool authenticatedRequest(Link& link, const char* url, const char* method, struct curl_slist* headers, const char* body, std::string* response, long* httpStatus = nullptr) {
+    if (!refreshAuthTokenIfNeeded(link)) {
+        curl_slist_free_all(headers);
         return false;
     }
 
     std::string authHeader = "Authorization: Bearer " + link.authToken;
-    struct curl_slist* authHeaders = curl_slist_append(headers, authHeader.c_str());
-    return sendRequest(url, method, authHeaders, body, response);
+    headers = curl_slist_append(headers, authHeader.c_str());
+    return sendRequest(url, method, headers, body, response, httpStatus);
+}
+
+static bool deleteSession(Link& link, const std::string& token) {
+    json_object* json_body = json_object_new_object();
+    json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
+
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
+
+    bool ok = authenticatedRequest(link, "https://discord.com/api/v9/users/@me/headless-sessions/delete",
+                                   "POST", headers, json_object_get_string(json_body), NULL);
+    json_object_put(json_body);
+    return ok;
 }
 
 // ------------------------------------------------------------------
-// headless session management (per-link)
+// headless sessions
 // ------------------------------------------------------------------
 
 void discordCleanupStaleSessions() {
-    // legacy plaintext sessions file -> delete best-effort + log
-    {
-        std::ifstream legacy(LEGACY_SESSIONS_PATH);
-        if (legacy.is_open()) {
-            legacy.close();
-            writeToLog("[Discord] Found legacy plaintext sessions file; deleting best-effort.");
-            if (remove(LEGACY_SESSIONS_PATH) != 0) {
-                writeToLog("[Discord] Failed to remove legacy plaintext sessions file.");
-            }
-        }
-    }
+    // the old plaintext format has no account info, so those sessions can't be deleted
+    remove(LEGACY_SESSIONS_PATH);
 
     std::string contents;
-    if (!readFileContents(SESSIONS_PATH, contents)) {
-        writeToLog("[Discord] No sessions.json found. Skipping cleanup.");
-        return;
-    }
-    if (contents.empty()) {
-        remove(SESSIONS_PATH);
-        return;
-    }
+    if (!readFileContents(SESSIONS_PATH, contents)) return;
+
+    // sessions that are still live or failed to delete stay in the file
+    std::vector<std::pair<std::string, std::string>> keep;
 
     json_object* root = json_tokener_parse(contents.c_str());
-    if (root == NULL) {
-        writeToLog("[Discord] sessions.json not valid JSON; deleting best-effort.");
-        remove(SESSIONS_PATH);
-        return;
-    }
-
-    json_object* sessions;
-    if (json_object_object_get_ex(root, "sessions", &sessions) &&
-        json_object_get_type(sessions) == json_type_array) {
-
-        int n = json_object_array_length(sessions);
-        writeToLog("[Discord] Cleaning up %d recorded session(s)...", n);
-
+    json_object* arr;
+    if (root != NULL && json_object_object_get_ex(root, "sessions", &arr) &&
+        json_object_get_type(arr) == json_type_array) {
+        int n = json_object_array_length(arr);
         for (int i = 0; i < n; i++) {
-            json_object* doc = json_object_array_get_idx(sessions, i);
-            if (doc == NULL) continue;
-
-            json_object* juid;
-            json_object* jtok;
-            if (!json_object_object_get_ex(doc, "switch_uid", &juid) ||
-                !json_object_object_get_ex(doc, "token", &jtok)) {
-                writeToLog("[Discord] Skipping malformed session entry.");
-                continue;
-            }
-
-            // copy out of json before any json_object_put
-            const char* uidRaw = json_object_get_string(juid);
-            const char* tokRaw = json_object_get_string(jtok);
-            std::string uidStr = (uidRaw != NULL) ? uidRaw : "";
-            std::string token  = (tokRaw != NULL) ? tokRaw : "";
+            json_object* entry = json_object_array_get_idx(arr, i);
+            std::string uidStr = jsonString(entry, "switch_uid");
+            std::string token = jsonString(entry, "token");
             if (token.empty()) continue;
 
-            AccountUid uid {};
-            accountUidFromString(uidStr, uid);
-            Link* link = resolveLink(uid);
-            if (link == NULL) {
-                writeToLog("[Discord] No link for session uid %s; skipping (cannot delete).", uidStr.c_str());
+            Link* link = findLink(uidStr);
+            if (link == nullptr) {
+                writeToLog("[Discord] %s is no longer linked, can't delete its session.", uidStr.c_str());
+                continue;
+            }
+            if (link->sessionToken == token) {
+                keep.push_back({uidStr, token});
                 continue;
             }
 
-            json_object* json_body = json_object_new_object();
-            json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
-            const char* body = json_object_get_string(json_body);
-
-            struct curl_slist* headers = NULL;
-            headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
-
-            writeToLog("[Discord] Deleting stale session for uid %s...", uidStr.c_str());
-            authenticatedRequest(*link, "https://discord.com/api/v9/users/@me/headless-sessions/delete",
-                                 "POST", headers, body, NULL);
-
-            json_object_put(json_body);
+            writeToLog("[Discord] Deleting stale session for %s", uidStr.c_str());
+            if (!deleteSession(*link, token)) keep.push_back({uidStr, token});
         }
     }
-
     json_object_put(root);
 
-    if (remove(SESSIONS_PATH) == 0) {
-        writeToLog("[Discord] Cleared sessions.json.");
-    } else {
-        writeToLog("[Discord] Failed to remove sessions.json after cleanup.");
-    }
+    removeFileAtomic(SESSIONS_PATH);
+    for (auto& entry : keep) setSessionEntry(entry.first, entry.second);
 }
 
-bool discordCreateHeadlessSession(Link& link, u64 titleId, std::string titleName, const bool includeToken) {
+bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startEpochSec, bool includeToken) {
     writeToLog("[Discord] Creating/Updating session for TID: %016llX (%s) on %s",
                (unsigned long long)titleId, titleName.c_str(), link.switchUidStr.c_str());
 
@@ -666,6 +550,14 @@ bool discordCreateHeadlessSession(Link& link, u64 titleId, std::string titleName
     json_object_object_add(json_activity, "name", json_object_new_string(titleName.c_str()));
     json_object_object_add(json_activity, "state", json_object_new_string("Nintendo Switch"));
 
+    // elapsed timer: discord shows (now - start). we pass a start moved forward
+    // to exclude sleep, so it counts real playtime. timestamps are in ms.
+    if (startEpochSec != 0) {
+        json_object* json_timestamps = json_object_new_object();
+        json_object_object_add(json_timestamps, "start", json_object_new_int64((int64_t)startEpochSec * 1000));
+        json_object_object_add(json_activity, "timestamps", json_timestamps);
+    }
+
     json_object* json_assets = json_object_new_object();
     json_object_object_add(json_assets, "large_image", json_object_new_string(iconUrl.c_str()));
     json_object_object_add(json_activity, "assets", json_assets);
@@ -674,88 +566,54 @@ bool discordCreateHeadlessSession(Link& link, u64 titleId, std::string titleName
     json_object_object_add(json_body, "activities", json_activities);
 
     if (includeToken && !link.sessionToken.empty()) {
-        writeToLog("[Discord] Including session token in request.");
         json_object_object_add(json_body, "token", json_object_new_string(link.sessionToken.c_str()));
     }
-
-    const char* body = json_object_get_string(json_body);
 
     struct curl_slist* headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
 
     std::string response;
-    bool success = authenticatedRequest(link, "https://discord.com/api/v9/users/@me/headless-sessions", "POST", headers, body, &response);
-    if (!success) {
-        writeToLog("[Discord] Failed to create/update headless session!");
-        json_object_put(json_body);
-
-        // if the attempt included an existing session token, retry once without
-        // it in case the (possibly stale) token was the problem.
-        if (includeToken) {
-            writeToLog("[Discord] Retrying headless session creation without session token...");
-            return discordCreateHeadlessSession(link, titleId, titleName, false);
-        }
-        return false;
-    }
-
+    long status = 0;
+    bool success = authenticatedRequest(link, "https://discord.com/api/v9/users/@me/headless-sessions", "POST",
+                                        headers, json_object_get_string(json_body), &response, &status);
     json_object_put(json_body);
 
-    json_object* json_response = json_tokener_parse(response.c_str());
-    if (json_response == NULL) {
-        writeToLog("[Discord] Failed to parse headless session response JSON!");
+    if (!success) {
+        writeToLog("[Discord] Failed to create/update headless session!");
+        // a rejected update means the session expired, so start a fresh one. after a
+        // timeout the update may have gone through, and a retry would leave two sessions.
+        if (includeToken && status >= 400 && status < 500) {
+            writeToLog("[Discord] Retrying headless session creation without session token...");
+            return discordCreateHeadlessSession(link, titleId, titleName, startEpochSec, false);
+        }
         return false;
     }
 
-    bool stored = false;
-    json_object* json_session_token;
-    if (json_object_object_get_ex(json_response, "token", &json_session_token)) {
-        const char* s = json_object_get_string(json_session_token);
-        std::string newToken = (s != NULL) ? s : "";
+    json_object* json_response = json_tokener_parse(response.c_str());
+    std::string token = json_response ? jsonString(json_response, "token") : "";
+    json_object_put(json_response);
 
-        if (!newToken.empty() && newToken != link.sessionToken) {
-            // a new session token: upsert it (keyed by this link's uid, one entry
-            // per uid) so stale-cleanup can delete it later with the right creds.
-            upsertSessionEntry(link.switchUidStr, newToken);
-        }
-
-        if (!newToken.empty()) {
-            link.sessionToken = newToken;
-            link.sessionTokenExpiry = time(NULL) + 900; // 15 mins to be safe.
-            stored = true;
-            writeToLog("[Discord] Stored session token for %s.", link.switchUidStr.c_str());
-        }
-    } else {
-        writeToLog("[Discord] Headless session response did NOT contain a session token. That shouldn't happen if the session was created successfully and discord returned 200.");
+    if (token.empty()) {
+        writeToLog("[Discord] Headless session response did not contain a session token.");
+        return false;
     }
 
-    json_object_put(json_response);
-    return stored;
+    if (token != link.sessionToken) {
+        link.sessionToken = token;
+        setSessionEntry(link.switchUidStr, token);
+    }
+    writeToLog("[Discord] Session active for %s.", link.switchUidStr.c_str());
+    return true;
 }
 
 void discordDeleteHeadlessSession(Link& link) {
+    if (link.sessionToken.empty()) return;
+
     writeToLog("[Discord] Deleting headless session for %s...", link.switchUidStr.c_str());
-
-    if (link.sessionToken.empty()) {
-        writeToLog("[Discord] No active session token to delete.");
-        return;
-    }
-
-    json_object* json_body = json_object_new_object();
-    json_object_object_add(json_body, "token", json_object_new_string(link.sessionToken.c_str()));
-    const char* body = json_object_get_string(json_body);
-
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
-
-    authenticatedRequest(link, "https://discord.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
-
-    json_object_put(json_body);
-
-    // drop this uid's entry from sessions.json (it is deleted server-side now).
-    upsertSessionEntry(link.switchUidStr, "");
-
-    // Clear the token so we don't try to use it again
+    bool deleted = deleteSession(link, link.sessionToken);
     link.sessionToken = "";
-    link.sessionTokenExpiry = 0;
-    writeToLog("[Discord] Session deleted.");
+
+    // if it failed (e.g. wifi already gone), the entry stays in the sessions
+    // file and the next stale cleanup tries again
+    if (deleted) setSessionEntry(link.switchUidStr, "");
 }

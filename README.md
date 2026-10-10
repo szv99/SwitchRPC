@@ -27,7 +27,7 @@ Head over to [the releases](https://github.com/llsc12/SwitchRPC/releases/latest)
 
 ## Nerd details
 
-Relies on tinfoil.io for game artworks. Uses Discord Social SDK endpoints for auth and its scope allow pushing presence data.
+Relies on Nintendo's CDN for game artworks. Uses Discord Social SDK endpoints for auth and its scope allow pushing presence data.
 
 Written in Embedded Swift!
 
@@ -42,6 +42,8 @@ Your phone opens the local page, which kicks off the Discord OAuth2 (PKCE) flow.
 The OAuth2 process happens entirely between your Switch, your phone, and Discord. The QR code is generated and displayed locally on the Switch screen, so no external/static web page is involved in showing it.
 
 The QR code (and its fallback URL) point to the Switch's own local web server on your network (`http://<switch_ip>:45601`). The Discord OAuth2 flow redirects the code and state back to that local address, which the Switch picks up to complete authentication. Discord refresh tokens are stored on the SD card per linked profile.
+
+UPDATE: I think I switched this to cf pages
 
 ## Credits
 

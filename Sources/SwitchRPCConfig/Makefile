@@ -66,16 +66,26 @@ LIBS := -lnx `curl-config --libs` -ljson-c
 
 # Swift specific flags
 CFLAGS += -DNXApp
-# Embedded Swift toolchain (a Swift development snapshot with Embedded support).
-# Override explicitly:  make SWIFT_TOOLCHAIN=/path/to/your.xctoolchain
-# or `export SWIFT_TOOLCHAIN=...`; otherwise auto-detect the newest snapshot
-# installed in ~/Library/Developer/Toolchains (macOS).
-SWIFT_TOOLCHAIN ?= $(lastword $(sort $(wildcard $(HOME)/Library/Developer/Toolchains/*.xctoolchain /Library/Developer/Toolchains/*.xctoolchain)))
-ifeq ($(strip $(SWIFT_TOOLCHAIN)),)
-$(error No Swift toolchain found. Install a Swift snapshot to ~/Library/Developer/Toolchains or set SWIFT_TOOLCHAIN=/path/to/your.xctoolchain)
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+	SWIFTC := $(shell xcrun --toolchain swift --find swiftc 2>/dev/null)
+	ifeq ($(strip $(SWIFTC)),)
+		SWIFTC := $(shell xcrun --find swiftc 2>/dev/null)
+	endif
+else
+	SWIFTC := $(shell command -v swiftc 2>/dev/null)
 endif
-SWIFTC := $(SWIFT_TOOLCHAIN)/usr/bin/swiftc
-UNICODE_SUPPORT = $(SWIFT_TOOLCHAIN)/usr/lib/swift/embedded/aarch64-none-none-elf/libswiftUnicodeDataTables.a
+
+ifeq ($(strip $(SWIFTC)),)
+$(error "Could not locate swiftc. Install a Swift toolchain (eg. via swiftly: https://www.swift.org/install) and make sure it's discoverable")
+endif
+
+SWIFT_USR := $(patsubst %/bin/swiftc,%,$(SWIFTC))
+UNICODE_SUPPORT := $(SWIFT_USR)/lib/swift/embedded/aarch64-none-none-elf/libswiftUnicodeDataTables.a
+
+# clang bundled with the swift toolchain, in case the host has none on PATH
+SWIFT_CLANG := $(SWIFT_USR)/bin/clang
 
 # Recursive Swift file discovery
 SWIFT_SRCS := $(shell find .. -name "*.swift" -type f)
@@ -267,7 +277,7 @@ $(OFILES_SRC)	: $(HFILES_BIN)
 
 $(OBJ_DIR)/app.o: $(LL_DIR)/app.ll
 	@mkdir -p $(OBJ_DIR)
-	@$(SWIFT_TOOLCHAIN)/usr/bin/clang -target aarch64 -fpic -ffreestanding \
+	@$(SWIFT_CLANG) -target aarch64 -fpic -ffreestanding \
 		-c $(LL_DIR)/app.ll -o $(OBJ_DIR)/app.o
 
 $(LL_DIR)/app.ll: $(SWIFT_SRCS)

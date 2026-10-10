@@ -11,18 +11,15 @@
 #define ICON_CACHE_PATH "sdmc:/config/switchrpc-eshop-iconcache.json"
 
 static bool loadIconFromCache(const char* titleId, std::string& out_url) {
-    std::ifstream file(ICON_CACHE_PATH);
-    if (!file.is_open()) return false;
-
-    std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    file.close();
+    std::string contents;
+    if (!readFileContents(ICON_CACHE_PATH, contents)) return false;
 
     json_object* root = json_tokener_parse(contents.c_str());
     if (!root) return false;
 
     json_object* val;
     bool found = false;
-    if (json_object_object_get_ex(root, titleId, &val)) {
+    if (json_object_object_get_ex(root, titleId, &val) && json_object_is_type(val, json_type_string)) {
         out_url = json_object_get_string(val);
         found = true;
     }
@@ -32,22 +29,18 @@ static bool loadIconFromCache(const char* titleId, std::string& out_url) {
 }
 
 static void saveIconToCache(const char* titleId, const char* url) {
-    std::ifstream infile(ICON_CACHE_PATH);
     std::string contents;
-    if (infile.is_open()) {
-        contents = std::string((std::istreambuf_iterator<char>(infile)), std::istreambuf_iterator<char>());
-        infile.close();
-    }
+    readFileContents(ICON_CACHE_PATH, contents);
 
     json_object* root = contents.empty() ? nullptr : json_tokener_parse(contents.c_str());
-    if (!root) root = json_object_new_object();
+    if (!json_object_is_type(root, json_type_object)) {
+        json_object_put(root);
+        root = json_object_new_object();
+    }
 
     json_object_object_add(root, titleId, json_object_new_string(url));
 
-    std::ofstream outfile(ICON_CACHE_PATH, std::ios::trunc);
-    if (outfile.is_open()) {
-        outfile << json_object_to_json_string(root);
-        outfile.close();
+    if (writeFileAtomic(ICON_CACHE_PATH, json_object_to_json_string(root))) {
         writeToLog("[eShop] Saved icon to cache for %s", titleId);
     } else {
         writeToLog("[eShop] Failed to write icon cache");
@@ -131,7 +124,8 @@ bool fetchEshopIconUrl(u64 titleId, std::string& out_url) {
                 json_object* app_id_obj;
                 json_object* img_obj;
                 if (json_object_object_get_ex(doc, "application_id_s", &app_id_obj) &&
-                    json_object_object_get_ex(doc, "image_url_sq_s", &img_obj))
+                    json_object_object_get_ex(doc, "image_url_sq_s", &img_obj) &&
+                    json_object_is_type(img_obj, json_type_string))
                 {
                     const char* app_id = json_object_get_string(app_id_obj);
                     if (app_id && strcmp(app_id, titleIdStr) == 0) {
@@ -173,4 +167,161 @@ void waitForNetworkReady() {
 
     svcSleepThread(1 * 1000 * 1000 * 1000ULL);
   }
+}
+
+
+// current process/title utilities
+
+// Return 0 on success, non-zero on error (int holds the libnx Result)
+Result get_app_info(AppInfo *info) {
+	u64 *out_pid = &info->pid;
+	u64 *out_tid = &info->tid;
+	
+	Result rc;
+	
+	rc = pmdmntGetApplicationProcessId(out_pid);
+	if (R_FAILED(rc)) return rc;
+	
+	rc = pmdmntGetProgramId(out_tid, *out_pid);
+	if (R_FAILED(rc)) return rc;
+	
+	NsApplicationControlData* appControlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+	if (appControlData == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+	
+	memset(appControlData, 0, sizeof(NsApplicationControlData));
+    u64 appControlDataSize = sizeof(NsApplicationControlData);
+	NacpLanguageEntry *languageEntry;
+	
+    Result res = 0;
+	if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, *out_tid, appControlData, appControlDataSize, &appControlDataSize))) {
+		if (R_SUCCEEDED(nacpGetLanguageEntry(&appControlData->nacp, &languageEntry))) {
+			if (languageEntry != NULL) {
+				strncpy(info->title_name, languageEntry->name, sizeof(info->title_name) - 1);
+				info->title_name[sizeof(info->title_name) - 1] = '\0';
+			} else {
+                res = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+			}
+		} else {
+            res = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+		}
+	} else {
+        res = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+	}
+
+	free(appControlData);
+
+    return res;
+}
+
+
+// sleep/wake via psc.
+// clocks are useless here - the whole sysmodule is frozen while asleep so time()
+// and the system tick don't move. psc gives us a real event instead. the
+// ReadySleep one fires *before* we sleep while wifi is still up, which is the
+// only moment we can kill the discord session so it doesn't hang around during
+// sleep. can't do the network call on this thread (tiny stack, and acking late
+// would stall the sleep), so it just pokes the main thread and waits.
+// id 0x5250 is a random unused id (system ones stop at 127), deps {fs, nifm} so
+// we go down before them on sleep and come back after them on wake.
+
+PscPmModule g_pscModule;
+Thread g_pscThread;
+bool g_pscReady = false;
+volatile bool g_pscThreadRun = true;
+volatile bool g_wokeFromSleep = false;
+volatile bool g_sleepPending = false;
+volatile bool g_asleep = false;
+UEvent g_pscWakeMain;
+UEvent g_sleepPrepDone;
+
+void pscThreadFunc(void* arg) {
+    while (g_pscThreadRun) {
+        // 1s timeout so we can bail out on shutdown
+        if (R_FAILED(eventWait(&g_pscModule.event, 1000000000ULL))) continue;
+
+        PscPmState state;
+        u32 flags = 0;
+        if (R_FAILED(pscPmModuleGetRequest(&g_pscModule, &state, &flags))) continue;
+
+        if (state == PscPmState_ReadySleep) {
+            // let the main thread kill the presence while wifi is still up, wait
+            // a bit for it, then ack - never block the sleep for long
+            // drop a late signal left over from a previous sleep that timed out
+            ueventClear(&g_sleepPrepDone);
+            g_sleepPending = true;
+            ueventSignal(&g_pscWakeMain);
+            waitSingle(waiterForUEvent(&g_sleepPrepDone), 4000000000ULL); // up to 4s
+        } else if (state == PscPmState_Awake) {
+            g_wokeFromSleep = true;
+            ueventSignal(&g_pscWakeMain);
+        }
+
+        pscPmModuleAcknowledge(&g_pscModule, state);
+    }
+}
+
+static int64_t g_timeOffset = 0;
+static bool g_timeSynced = false;
+
+u64 getRawNowSec() {
+    u64 rawLocal = 0;
+    if (R_FAILED(timeGetCurrentTime(TimeType_Default, &rawLocal)) || rawLocal == 0) {
+        rawLocal = (u64)time(NULL);
+    }
+    return rawLocal;
+}
+
+u64 getCorrectedNowSec() {
+    return (u64)((int64_t)getRawNowSec() + g_timeOffset);
+}
+
+void syncTimeWithServer(time_t serverUtc) {
+    int64_t newOffset = (int64_t)serverUtc - (int64_t)getRawNowSec();
+    // the Date header only has 1s resolution, ignore jitter from that and request latency
+    int64_t delta = newOffset - g_timeOffset;
+    if (g_timeSynced && delta >= -2 && delta <= 2) return;
+
+    g_timeOffset = newOffset;
+    g_timeSynced = true;
+    writeToLog("[Network] Clock offset from server time: %lld seconds", (long long)g_timeOffset);
+}
+
+bool readFileContents(const char* path, std::string& out) {
+    std::ifstream file(path);
+    // writeFileAtomic briefly has only the .tmp file between its remove and rename
+    if (!file.is_open()) file.open(std::string(path) + ".tmp");
+    if (!file.is_open()) return false;
+    out.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    return true;
+}
+
+bool writeFileAtomic(const char* path, const std::string& data) {
+    std::string tmp = std::string(path) + ".tmp";
+
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        writeToLog("[File] Failed to open %s for writing", tmp.c_str());
+        return false;
+    }
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) {
+        writeToLog("[File] Failed to write %s", tmp.c_str());
+        remove(tmp.c_str());
+        return false;
+    }
+
+    // rename can't replace an existing file on the sd card. readFileContents
+    // falls back to the .tmp file until the rename is done.
+    remove(path);
+    if (rename(tmp.c_str(), path) != 0) {
+        writeToLog("[File] Failed to move %s into place", tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void removeFileAtomic(const char* path) {
+    remove(path);
+    remove((std::string(path) + ".tmp").c_str());
 }

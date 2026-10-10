@@ -5,95 +5,76 @@
 #include <switch.h>
 #include <string>
 #include <vector>
-#include <time.h>
 
 // ------------------------------------------------------------------
-// Per-Switch-user link model
+// Switch user -> Discord account links
 // ------------------------------------------------------------------
 
-// A Link connects a single Switch user profile to a single Discord account.
-// Each link carries its OWN OAuth credentials and (at runtime) its OWN
-// active headless-session token.
+// One Switch user profile linked to one Discord account. Each link has its own
+// OAuth credentials and its own headless session.
 struct Link {
-    AccountUid switchUid {};              // all-zero == DEFAULT/wildcard link
-    std::string switchUidStr;             // "%016llx-%016llx"
-    std::string discordId;               // display only / sessions bookkeeping
-    std::string discordUsername;         // display only
-    std::string refreshToken;            // ROTATES on each refresh
-    std::string authToken;               // bearer token (in-memory only)
-    time_t authTokenExpiry = 0;          // when authToken expires (epoch secs)
+    AccountUid switchUid {};    // all zero = the "Default" link, used for unlinked users
+    std::string switchUidStr;   // "%016llx-%016llx", same format as the config app
+    std::string discordId;
+    std::string discordUsername;
+    std::string refreshToken;   // rotates on every refresh
 
-    // runtime-only headless session state for this link
-    std::string sessionToken;            // active rich-presence session token
-    time_t sessionTokenExpiry = 0;       // derived (request time + ~15 min)
+    // runtime only, never written to disk
+    std::string authToken;
+    u64 authTokenExpiry = 0;    // raw clock, see getRawNowSec()
+    std::string sessionToken;   // active headless session, empty if none
 };
 
-// ------------------------------------------------------------------
-// switch_uid serialization helpers (MUST match the Swift config app)
-// ------------------------------------------------------------------
 std::string accountUidToString(const AccountUid& uid);
 bool accountUidFromString(const std::string& s, AccountUid& out);
 
-// ------------------------------------------------------------------
-// Link storage
-// ------------------------------------------------------------------
-
 /**
- * (Re)load all links from sdmc:/config/switchrpc_profiles.json.
- * If that file is absent, falls back to the legacy single
- * sdmc:/config/switchrpc_token as one default/wildcard link.
- * Populates and returns the global link table. Safe to call only when no
- * active Link pointer is being held (it clears/rebuilds the table).
+ * Loads links from sdmc:/config/switchrpc_profiles.json, or from the legacy
+ * sdmc:/config/switchrpc_token (as a single Default link) if there's no profiles file.
+ * Invalidates every Link pointer handed out before.
  */
-std::vector<Link>& loadLinks();
+void loadLinks();
 
 /**
- * Resolve a playing user's AccountUid to a link.
- * Returns the exact switch_uid match if present, else the default/wildcard
- * (all-zero) link if present, else nullptr (meaning: no presence).
- * Returned pointer is valid until the next loadLinks() call.
+ * Re-reads the links if the config app changed them since the last load.
+ * Links whose refresh token didn't change keep their auth and session tokens.
+ * Sessions of links that were removed or relinked are deleted first, with the
+ * old credentials. Invalidates Link pointers if it returns true.
+ */
+bool reloadLinksIfChanged();
+
+/**
+ * The link for a Switch user: the exact match if there is one, else the Default
+ * link, else nullptr (no presence for that user).
  */
 Link* resolveLink(const AccountUid& uid);
 
 /**
- * Persist a (rotated) refresh token back to switchrpc_profiles.json for the
- * link's switch_uid (preserving every other entry), or to the legacy
- * switchrpc_token file if the links were loaded from legacy.
+ * The link with the given switch_uid string, or nullptr.
  */
-void persistLinkRefreshToken(const Link& link);
-
-/**
- * Refresh the link's auth token if it is missing/expired (rotates and
- * persists the refresh token). Returns true if a usable auth token is held.
- */
-bool refreshAuthTokenIfNeeded(Link& link);
+Link* findLink(const std::string& switchUidStr);
 
 // ------------------------------------------------------------------
-// Public Discord API Functions
+// Headless sessions
 // ------------------------------------------------------------------
 
 /**
- * Creates or updates a Discord Headless Session to show the current game for
- * the given link's Discord account.
+ * Creates or updates the link's Discord headless session to show the current game.
  *
- * @param link          The resolved link (owning Discord account).
- * @param titleId       The Title ID of the currently running game.
- * @param titleName     The display name of the running game.
- * @param includeToken  Whether to include the link's current sessionToken.
- * @return true only if a session token was successfully obtained and stored.
+ * @param startEpochSec Unix time (seconds) the elapsed timer counts from; 0 to omit it.
+ * @param includeToken Whether to update the link's existing session instead of making a new one.
+ * @return true if Discord returned a session token.
  */
-bool discordCreateHeadlessSession(Link& link, u64 titleId, std::string titleName, const bool includeToken);
+bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startEpochSec, bool includeToken);
 
 /**
- * Deletes the link's active Discord Headless Session.
- * Call this when the game closes, the active link changes, or on exit.
+ * Deletes the link's active headless session, if it has one.
  */
 void discordDeleteHeadlessSession(Link& link);
 
 /**
- * Deletes all known sessions recorded in switchrpc_sessions.json, resolving
- * each entry to its owning link (by switch_uid) for the correct credentials,
- * then clears the file. A legacy plaintext sessions file is deleted
- * best-effort. Requires loadLinks() to have been called first.
+ * Deletes every session recorded in sdmc:/config/switchrpc_sessions.json, using
+ * the credentials of the link that created it, then clears the file.
+ * Call on startup and after waking up.
  */
 void discordCleanupStaleSessions();
