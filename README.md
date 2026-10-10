@@ -17,7 +17,7 @@ In the config app, pick a profile and press A to link it (or relink it to anothe
 > Like this project? Own a Mac for developing? You might like [XRPC, Xcode Rich Presence done right](https://github.com/llsc12/XRPC).
 
 ## Installing
-Head over to [the releases](https://github.com/llsc12/SwitchRPC/releases/latest) and follow the instructions to download the latest version.
+Head over to [the releases](https://github.com/szv99/SwitchRPC/releases/latest) and follow the instructions to download the latest version.
 
 ## Nerd details
 
