@@ -213,7 +213,6 @@ int main(int argc, char* argv[])
     u64 attemptInterval = 0;  // REFRESH_INTERVAL after a success, RETRY_INTERVAL after a failure
     u64 accumulatedAwake = 0; // seconds of awake playtime banked for the current game
     u64 chunkStartRaw = 0;    // raw local seconds when the current awake play chunk started
-    u64 chunkStartCorrected = 0; // corrected absolute timestamp for Discord session start
 
     loadLinks();
     writeSwitchUsers();
@@ -260,7 +259,6 @@ int main(int argc, char* argv[])
             if (lastInfo.tid != 0) {
                 writeToLog("[SwitchRPC] Wake from sleep (PSC). Resuming session for TID: %016llX", (unsigned long long)lastInfo.tid);
                 chunkStartRaw = getRawNowSec();
-                chunkStartCorrected = getCorrectedNowSec();
             }
             attemptInterval = 0;
         }
@@ -294,7 +292,6 @@ int main(int argc, char* argv[])
                     lastInfo = info;
                     accumulatedAwake = 0;
                     chunkStartRaw = getRawNowSec();
-                    chunkStartCorrected = getCorrectedNowSec();
                     attemptInterval = 0;
                     waitForNetworkReady();
                 }
@@ -302,7 +299,7 @@ int main(int argc, char* argv[])
                 Link* link = linkForCurrentUser();
                 Link* active = activeLink();
                 u64 now = getRawNowSec();
-                u64 displayStart = chunkStartCorrected - accumulatedAwake; // moved forward to skip sleep
+                u64 displayStart = chunkStartRaw - accumulatedAwake; // moved forward to skip sleep
 
                 // a different user is playing now, or the current one got unlinked
                 if (link != active && active != nullptr) {
@@ -334,7 +331,6 @@ int main(int argc, char* argv[])
                     lastInfo = {0};
                     accumulatedAwake = 0;
                     chunkStartRaw = 0;
-                    chunkStartCorrected = 0;
 
                     clearPresence();
                 }

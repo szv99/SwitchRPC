@@ -55,9 +55,10 @@ void pscThreadFunc(void*);
 u64 getRawNowSec();
 
 /**
- * Returns the current Unix time (seconds), corrected with the offset from server Date headers.
+ * Converts a raw console clock time to real Unix time, using the offset learned
+ * from server Date headers so far.
  */
-u64 getCorrectedNowSec();
+u64 rawToRealTime(u64 rawSec);
 
 /**
  * Updates the clock offset from a server's Date header value (Unix seconds).

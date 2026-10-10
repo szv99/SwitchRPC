@@ -134,6 +134,7 @@ bool reloadLinksIfChanged() {
     for (Link& old : previous) {
         Link* current = findLink(old.switchUidStr);
         if (current != nullptr && current->refreshToken == old.refreshToken) {
+            current->revoked = old.revoked;
             current->authToken = old.authToken;
             current->authTokenExpiry = old.authTokenExpiry;
             current->sessionToken = old.sessionToken;
@@ -411,6 +412,8 @@ bool sendRequest(const char* url, const char* method, struct curl_slist* headers
 }
 
 static bool refreshAuthTokenIfNeeded(Link& link) {
+    if (link.revoked) return false;
+
     // reuse the token until 5 minutes before it expires
     if (!link.authToken.empty() && getRawNowSec() + 300 < link.authTokenExpiry) {
         return true;
@@ -424,7 +427,14 @@ static bool refreshAuthTokenIfNeeded(Link& link) {
 
     std::string response;
     if (!sendRequest("https://gaming-sdk.com/api/v9/oauth2/token", "POST", headers, body.c_str(), &response)) {
-        writeToLog("[Discord] Auth token refresh failed for %s", link.switchUidStr.c_str());
+        // the token was revoked, or rotated by a refresh whose response got lost.
+        // retrying can't fix that, so wait for the profile to be relinked.
+        if (response.find("invalid_grant") != std::string::npos) {
+            link.revoked = true;
+            writeToLog("[Discord] Discord rejected the refresh token for %s, relink it in the config app.", link.switchUidStr.c_str());
+        } else {
+            writeToLog("[Discord] Auth token refresh failed for %s", link.switchUidStr.c_str());
+        }
         return false;
     }
 
@@ -526,7 +536,13 @@ void discordCleanupStaleSessions() {
     for (auto& entry : keep) setSessionEntry(entry.first, entry.second);
 }
 
-bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startEpochSec, bool includeToken) {
+bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startRawSec, bool includeToken) {
+    if (link.revoked) return false; // already logged when it happened
+
+    // refresh first: right after boot that's the first request to discord, and
+    // its Date header gives the clock offset needed for the start timestamp
+    if (!refreshAuthTokenIfNeeded(link)) return false;
+
     writeToLog("[Discord] Creating/Updating session for TID: %016llX (%s) on %s",
                (unsigned long long)titleId, titleName.c_str(), link.switchUidStr.c_str());
 
@@ -552,9 +568,9 @@ bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& ti
 
     // elapsed timer: discord shows (now - start). we pass a start moved forward
     // to exclude sleep, so it counts real playtime. timestamps are in ms.
-    if (startEpochSec != 0) {
+    if (startRawSec != 0) {
         json_object* json_timestamps = json_object_new_object();
-        json_object_object_add(json_timestamps, "start", json_object_new_int64((int64_t)startEpochSec * 1000));
+        json_object_object_add(json_timestamps, "start", json_object_new_int64((int64_t)rawToRealTime(startRawSec) * 1000));
         json_object_object_add(json_activity, "timestamps", json_timestamps);
     }
 
@@ -584,7 +600,7 @@ bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& ti
         // timeout the update may have gone through, and a retry would leave two sessions.
         if (includeToken && status >= 400 && status < 500) {
             writeToLog("[Discord] Retrying headless session creation without session token...");
-            return discordCreateHeadlessSession(link, titleId, titleName, startEpochSec, false);
+            return discordCreateHeadlessSession(link, titleId, titleName, startRawSec, false);
         }
         return false;
     }

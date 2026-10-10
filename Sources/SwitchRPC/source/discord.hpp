@@ -20,6 +20,7 @@ struct Link {
     std::string refreshToken;   // rotates on every refresh
 
     // runtime only, never written to disk
+    bool revoked = false;       // discord rejected the refresh token, needs relinking
     std::string authToken;
     u64 authTokenExpiry = 0;    // raw clock, see getRawNowSec()
     std::string sessionToken;   // active headless session, empty if none
@@ -61,11 +62,11 @@ Link* findLink(const std::string& switchUidStr);
 /**
  * Creates or updates the link's Discord headless session to show the current game.
  *
- * @param startEpochSec Unix time (seconds) the elapsed timer counts from; 0 to omit it.
+ * @param startRawSec Raw console clock time (see getRawNowSec) the elapsed timer counts from; 0 to omit it.
  * @param includeToken Whether to update the link's existing session instead of making a new one.
  * @return true if Discord returned a session token.
  */
-bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startEpochSec, bool includeToken);
+bool discordCreateHeadlessSession(Link& link, u64 titleId, const std::string& titleName, u64 startRawSec, bool includeToken);
 
 /**
  * Deletes the link's active headless session, if it has one.

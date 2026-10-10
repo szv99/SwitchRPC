@@ -271,8 +271,8 @@ u64 getRawNowSec() {
     return rawLocal;
 }
 
-u64 getCorrectedNowSec() {
-    return (u64)((int64_t)getRawNowSec() + g_timeOffset);
+u64 rawToRealTime(u64 rawSec) {
+    return (u64)((int64_t)rawSec + g_timeOffset);
 }
 
 void syncTimeWithServer(time_t serverUtc) {
