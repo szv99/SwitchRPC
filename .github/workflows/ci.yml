@@ -46,18 +46,12 @@ jobs:
             libncurses6 libpython3.11 libsqlite3-0 libstdc++-12-dev \
             libxml2-dev libz3-dev pkg-config tzdata zlib1g-dev zip
 
-      - name: Cache devkitPro switch portlibs
-        id: cache-portlibs
-        uses: actions/cache@v4
-        with:
-          path: /opt/devkitpro/portlibs/switch
-          key: dkp-portlibs-switch-curl-switch-libjson-c-v1
-
-      - name: Install switch portlibs
-        if: steps.cache-portlibs.outputs.cache-hit != 'true'
+      # the devkita64 image ships the switch-portlibs group, which has curl and json-c.
+      # pkg.devkitpro.org answers CI runners with 403, so they must not be fetched again.
+      - name: Check switch portlibs
         run: |
-          dkp-pacman -Sy --noconfirm switch-curl switch-libjson-c
-          dkp-pacman -Scc --noconfirm
+          test -f /opt/devkitpro/portlibs/switch/include/curl/curl.h
+          test -f /opt/devkitpro/portlibs/switch/include/json-c/json.h
 
       - name: Build
         env:
