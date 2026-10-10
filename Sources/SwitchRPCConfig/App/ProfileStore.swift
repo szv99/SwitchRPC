@@ -2,23 +2,23 @@
 //  ProfileStore.swift
 //  SwitchRPC
 //
-//  Store over sdmc:/config/switchrpc_profiles.json linking Switch user
-//  profiles to Discord accounts. See SHARED CONTRACT (v1).
+//  Links between Switch user profiles and Discord accounts, stored in
+//  sdmc:/config/switchrpc_profiles.json and shared with the sysmodule.
 //
 
-import devkitpro  // C stdio: fopen/fclose/fgets/fputs/fread/remove
+import devkitpro  // C stdio
 import libnx
 
-/// One Switch-user -> Discord link entry.
+/// A Switch user profile linked to a Discord account.
 struct Link {
-	var switchUid: String        // "<16hex>-<16hex>" (all-zero = default/wildcard)
-	var switchNickname: String   // display only
-	var discordId: String        // discord user id, may be ""
-	var discordUsername: String  // display only
-	var refreshToken: String     // discord OAuth refresh token (rotates)
+	var switchUid: String  // "<16 hex>-<16 hex>", all zero for the Default link
+	var switchNickname: String
+	var discordId: String
+	var discordUsername: String
+	var refreshToken: String  // the sysmodule replaces it whenever Discord rotates it
 }
 
-/// A Switch user reported by the sysmodule via switchrpc_users.json.
+/// A Switch user, as listed by the sysmodule in switchrpc_users.json.
 struct SwitchUser {
 	var uid: String
 	var nickname: String
@@ -27,75 +27,35 @@ struct SwitchUser {
 enum ProfileStore {
 	static let profilesPath = "sdmc:/config/switchrpc_profiles.json"
 	static let legacyTokenPath = "sdmc:/config/switchrpc_token"
-	/// Switch user list, written by the sysmodule (which has account access).
 	static let usersPath = "sdmc:/config/switchrpc_users.json"
-	/// all-zero uid string == DEFAULT / wildcard link
+	/// The Default link applies to every user that isn't linked on their own.
 	static let defaultUid = "0000000000000000-0000000000000000"
 
-	// MARK: - AccountUid <-> switch_uid string
-
-	/// Lowercase, zero-padded 16-char hex for a UInt64.
-	static func hex16(_ value: UInt64) -> String {
-		let hexChars: [UInt8] = Array("0123456789abcdef".utf8)
-		var out = [UInt8](repeating: 0, count: 17)
-		var v = value
-		var i = 15
-		while i >= 0 {
-			out[i] = hexChars[Int(v & 0xF)]
-			v >>= 4
-			i -= 1
-		}
-		out[16] = 0  // null-terminate
-		return String(cStr: out)
-	}
-
-	/// Parse a hex substring into a UInt64, or nil if invalid.
-	static func parseHex(_ s: Substring) -> UInt64? {
-		if s.isEmpty { return nil }
-		var result: UInt64 = 0
-		for ch in s.utf8 {
-			let digit: UInt64
-			switch ch {
-			case 0x30...0x39: digit = UInt64(ch - 0x30)         // 0-9
-			case 0x61...0x66: digit = UInt64(ch - 0x61 + 10)    // a-f
-			case 0x41...0x46: digit = UInt64(ch - 0x41 + 10)    // A-F
-			default: return nil
-			}
-			result = (result << 4) | digit
-		}
-		return result
-	}
-
-	/// "%016llx-%016llx" of uid.uid[0], uid.uid[1].
+	/// Same format as the sysmodule: "%016llx-%016llx".
 	static func uidToString(_ uid: AccountUid) -> String {
 		return hex16(uid.uid.0) + "-" + hex16(uid.uid.1)
 	}
 
-	/// Parse a switch_uid string back into an AccountUid.
-	static func stringToUid(_ s: String) -> AccountUid? {
-		let parts = s.split(separator: "-")
-		guard parts.count == 2 else { return nil }
-		guard let hi = parseHex(parts[0]), let lo = parseHex(parts[1]) else {
-			return nil
+	private static func hex16(_ value: UInt64) -> String {
+		let digits = Array("0123456789abcdef".utf8)
+		var out = [UInt8](repeating: 0, count: 17)  // 16 digits + null terminator
+		for i in 0..<16 {
+			out[15 - i] = digits[Int((value >> (UInt64(i) * 4)) & 0xF)]
 		}
-		var uid = AccountUid()
-		uid.uid.0 = hi
-		uid.uid.1 = lo
-		return uid
+		return String(cStr: out)
 	}
 
-	// MARK: - Raw file IO
+	// MARK: - Files
 
 	static func fileExists(_ path: String) -> Bool {
-		if let f = fopen(path, "r") {
-			fclose(f)
-			return true
-		}
-		return false
+		guard let file = fopen(path, "r") else { return false }
+		fclose(file)
+		return true
 	}
 
 	static func readFile(_ path: String) -> String? {
-		guard let file = fopen(path, "rb") else { return nil }
+		// writeFile briefly has only the .tmp file between its remove and rename
+		guard let file = fopen(path, "rb") ?? fopen(path + ".tmp", "rb") else { return nil }
 		defer { fclose(file) }
 		var data = [UInt8]()
 		var chunk = [UInt8](repeating: 0, count: 4096)
@@ -105,123 +65,113 @@ enum ProfileStore {
 			data.append(contentsOf: chunk[0..<n])
 		}
 		if data.isEmpty { return nil }
-		data.append(0)  // null-terminate
+		data.append(0)
 		return String(cStr: data)
 	}
 
-	static func writeFile(_ path: String, _ content: String) {
-		if let file = fopen(path, "w") {
-			fputs(content, file)
-			fclose(file)
+	/// Writes through a temp file and a rename, like the sysmodule, so neither
+	/// side ever reads a half written file.
+	@discardableResult
+	static func writeFile(_ path: String, _ content: String) -> Bool {
+		let tmp = path + ".tmp"
+		guard let file = fopen(tmp, "wb") else { return false }
+		let written = fputs(content, file) >= 0
+		let closed = fclose(file) == 0
+		guard written && closed else {
+			remove(tmp)
+			return false
 		}
+		remove(path)  // rename can't replace an existing file on the sd card
+		return rename(tmp, path) == 0
 	}
 
 	// MARK: - Load / Save
 
-	/// Switch users as enumerated by the sysmodule and written to disk.
 	static func loadSwitchUsers() -> [SwitchUser] {
-		guard let content = readFile(usersPath) else { return [] }
-		guard let json = JSONValue.parse(from: content) else { return [] }
-		guard let arr = json["users"].array else { return [] }
-		var users: [SwitchUser] = []
-		for item in arr {
-			let uid = item["uid"].string ?? ""
-			if uid.isEmpty { continue }
-			users.append(
-				SwitchUser(uid: uid, nickname: item["nickname"].string ?? "Unknown")
-			)
+		guard let content = readFile(usersPath),
+			let users = JSONValue.parse(from: content)?["users"].array
+		else { return [] }
+
+		return users.compactMap { item in
+			guard let uid = item["uid"].string, !uid.isEmpty else { return nil }
+			return SwitchUser(uid: uid, nickname: item["nickname"].string ?? "Unknown")
 		}
-		return users
 	}
 
 	static func load() -> [Link] {
-		guard let content = readFile(profilesPath) else { return [] }
-		guard let json = JSONValue.parse(from: content) else { return [] }
-		guard let arr = json["links"].array else { return [] }
-		var links: [Link] = []
-		for item in arr {
-			let su = item["switch_uid"].string ?? ""
-			if su.isEmpty { continue }
-			links.append(
-				Link(
-					switchUid: su,
-					switchNickname: item["switch_nickname"].string ?? "",
-					discordId: item["discord_id"].string ?? "",
-					discordUsername: item["discord_username"].string ?? "",
-					refreshToken: item["refresh_token"].string ?? ""
-				)
-			)
-		}
-		return links
+		loadIfValid() ?? []
 	}
 
-	static func save(_ links: [Link]) {
-		var arr: [JSONValue] = []
-		for link in links {
-			let obj: [String: JSONValue] = [
+	/// nil if the file exists but can't be parsed, so an update doesn't replace it with nothing.
+	private static func loadIfValid() -> [Link]? {
+		guard let content = readFile(profilesPath) else { return [] }
+		guard let links = JSONValue.parse(from: content)?["links"].array else { return nil }
+
+		return links.compactMap { item in
+			guard let uid = item["switch_uid"].string, !uid.isEmpty else { return nil }
+			return Link(
+				switchUid: uid,
+				switchNickname: item["switch_nickname"].string ?? "",
+				discordId: item["discord_id"].string ?? "",
+				discordUsername: item["discord_username"].string ?? "",
+				refreshToken: item["refresh_token"].string ?? ""
+			)
+		}
+	}
+
+	@discardableResult
+	static func save(_ links: [Link]) -> Bool {
+		let entries: [JSONValue] = links.map { link in
+			JSONValue([
 				"switch_uid": JSONValue(link.switchUid),
 				"switch_nickname": JSONValue(link.switchNickname),
 				"discord_id": JSONValue(link.discordId),
 				"discord_username": JSONValue(link.discordUsername),
 				"refresh_token": JSONValue(link.refreshToken),
-			]
-			arr.append(JSONValue(obj))
+			])
 		}
-		let root: [String: JSONValue] = [
+		let root = JSONValue([
 			"version": JSONValue(1),
-			"links": JSONValue(arr),
-		]
-		guard let str = JSONValue(root).stringify() else { return }
-		writeFile(profilesPath, str)
+			"links": JSONValue(entries),
+		])
+		guard let json = root.stringify() else { return false }
+		return writeFile(profilesPath, json)
 	}
 
-	/// Insert or replace a link by switch_uid, preserving all others.
-	static func upsert(_ link: Link) {
-		var links = load()
-		var found = false
-		for i in 0..<links.count {
-			if links[i].switchUid == link.switchUid {
-				links[i] = link
-				found = true
-				break
-			}
+	/// Adds the link, replacing any existing one for the same Switch user.
+	static func upsert(_ link: Link) -> Bool {
+		guard var links = loadIfValid() else { return false }
+		if let index = links.firstIndex(where: { $0.switchUid == link.switchUid }) {
+			links[index] = link
+		} else {
+			links.append(link)
 		}
-		if !found { links.append(link) }
-		save(links)
+		return save(links)
 	}
 
-	/// Remove the link with the given switch_uid, preserving all others.
-	/// Named `removeLink` (not `remove`) so it does not shadow the C stdio
-	/// `remove(path)` used by `migrateLegacyIfNeeded()` below.
-	static func removeLink(switchUid: String) {
-		var links = load()
+	/// Not named `remove` so it doesn't shadow C's remove(path).
+	static func removeLink(switchUid: String) -> Bool {
+		guard var links = loadIfValid() else { return false }
 		links.removeAll { $0.switchUid == switchUid }
-		save(links)
+		return save(links)
 	}
 
-	// MARK: - Legacy migration (owned by the config app)
+	// MARK: - Legacy migration
 
-	/// Read the legacy single-token file, trimming trailing whitespace.
-	static func readLegacyToken() -> String? {
-		guard let file = fopen(legacyTokenPath, "r") else { return nil }
-		var tokenBuffer = [CChar](repeating: 0, count: 1024)
-		fgets(&tokenBuffer, Int32(tokenBuffer.count), file)
-		fclose(file)
-		var token = String(cStr: tokenBuffer)
-		while let last = token.last,
-			last == "\n" || last == "\r" || last == " " || last == "\t"
-		{
-			token.removeLast()
-		}
-		return token.isEmpty ? nil : token
-	}
-
-	/// If profiles.json is absent but a non-empty legacy token exists, create
-	/// profiles.json with a single default/wildcard link, then delete the
-	/// legacy token only after profiles.json is written successfully.
+	/// Older versions stored a single refresh token in switchrpc_token. Turn it into
+	/// the Default link, so the existing account keeps working for every user.
 	static func migrateLegacyIfNeeded() {
 		if fileExists(profilesPath) { return }
-		guard let token = readLegacyToken() else { return }
+		guard let file = fopen(legacyTokenPath, "r") else { return }
+		var buffer = [CChar](repeating: 0, count: 1024)
+		fgets(&buffer, Int32(buffer.count), file)
+		fclose(file)
+
+		var token = String(cStr: buffer)
+		while let last = token.last, last == "\n" || last == "\r" || last == " " || last == "\t" {
+			token.removeLast()
+		}
+		if token.isEmpty { return }
 
 		let link = Link(
 			switchUid: defaultUid,
@@ -230,11 +180,9 @@ enum ProfileStore {
 			discordUsername: "",
 			refreshToken: token
 		)
-		save([link])
-
-		// only delete the legacy file once profiles.json is on disk
-		if fileExists(profilesPath) {
-			remove(legacyTokenPath)  // C stdio remove(path)
+		// only drop the old file once the new one is safely written
+		if save([link]) {
+			remove(legacyTokenPath)
 		}
 	}
 }

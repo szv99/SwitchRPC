@@ -7,8 +7,6 @@ let sysmoduleTitleId: UInt64 = 0x3120000000000092
 @main
 struct App: NXApp {
 	nonisolated(unsafe) static let discord = Discord()
-	nonisolated(unsafe) static let server: WebServer = .shared
-	nonisolated(unsafe) static var webConfig: WebCommonConfig = .init()
 
 	var menu: Menu = Menu()
 
@@ -58,11 +56,10 @@ struct App: NXApp {
 	}
 }
 
-/// One selectable row in the profile menu (a Switch user, or the default).
+/// A row in the menu: a Switch user, or the Default link used for users without their own.
 struct ProfileEntry {
-	var uid: String        // switch_uid string
-	var nickname: String   // display name
-	var isDefault: Bool    // true for the "Default (all profiles)" pseudo-entry
+	var uid: String
+	var nickname: String
 }
 
 struct Menu {
@@ -72,9 +69,7 @@ struct Menu {
 	var selectedIndex = 0
 	var didSetup = false
 
-	/// Switch profiles plus the trailing default pseudo-entry.
 	var entries: [ProfileEntry] = []
-	/// Current Switch -> Discord links, for status display.
 	var links: [Link] = []
 
 	var logs: [String] = [] {
@@ -86,7 +81,8 @@ struct Menu {
 		}
 	}
 
-	// MARK: - Setup / reload
+	// entries plus the trailing "Exit app" row
+	var rowCount: Int { entries.count + 1 }
 
 	mutating func setupIfNeeded() {
 		if didSetup { return }
@@ -96,81 +92,53 @@ struct Menu {
 	}
 
 	mutating func reload() {
-		self.links = ProfileStore.load()
-		self.entries = Menu.enumerateProfiles()
-		// keep the selection in range (entries + trailing "Exit app")
-		let count = entries.count + 1
-		if selectedIndex >= count { selectedIndex = 0 }
-		self.wasInvalidated = true
+		links = ProfileStore.load()
+		entries = Menu.loadProfiles()
+		if selectedIndex >= rowCount { selectedIndex = 0 }
+		wasInvalidated = true
 	}
 
-	/// Build the profile list: the Switch users (read from switchrpc_users.json,
-	/// which the sysmodule writes because the config app can't read the account
-	/// service when launched as an applet), then the "Default" pseudo-entry.
-	static func enumerateProfiles() -> [ProfileEntry] {
-		var result: [ProfileEntry] = []
-
-		let users = ProfileStore.loadSwitchUsers()
-		for u in users {
-			result.append(
-				ProfileEntry(uid: u.uid, nickname: u.nickname, isDefault: false)
-			)
+	/// The Switch users, then the Default entry.
+	static func loadProfiles() -> [ProfileEntry] {
+		// the account service isn't usable when the app runs as an applet (from the
+		// album), so the sysmodule writes the user list to the sd card for us
+		var result = ProfileStore.loadSwitchUsers().map {
+			ProfileEntry(uid: $0.uid, nickname: $0.nickname)
 		}
 
-		// Fallback: if that file isn't present yet (sysmodule hasn't run), try the
-		// account service directly — only works if launched in application mode.
-		if users.isEmpty {
-			var uids = [AccountUid](repeating: AccountUid(), count: 8)
+		// no list yet (sysmodule not running), ask the account service directly,
+		// which works when launched as an application
+		if result.isEmpty {
+			var uids = [AccountUid](repeating: AccountUid(), count: Int(ACC_USER_LIST_SIZE))
 			var total: Int32 = 0
-			if accountListAllUsers(&uids, 8, &total).succeeded {
-				var i = 0
-				while i < Int(total) && i < uids.count {
-					let uid = uids[i]
+			if accountListAllUsers(&uids, Int32(uids.count), &total).succeeded {
+				for uid in uids.prefix(Int(total)) {
 					result.append(
-						ProfileEntry(
-							uid: ProfileStore.uidToString(uid),
-							nickname: getNickname(uid) ?? "Unknown",
-							isDefault: false
-						)
+						ProfileEntry(uid: ProfileStore.uidToString(uid), nickname: nickname(of: uid) ?? "Unknown")
 					)
-					i += 1
 				}
 			}
 		}
 
-		result.append(
-			ProfileEntry(
-				uid: ProfileStore.defaultUid,
-				nickname: "Default (all profiles)",
-				isDefault: true
-			)
-		)
+		result.append(ProfileEntry(uid: ProfileStore.defaultUid, nickname: "Default (unlinked users)"))
 		return result
 	}
 
-	/// Read a Switch user's nickname via accountGetProfile/accountProfileGet.
-	static func getNickname(_ uid: AccountUid) -> String? {
+	static func nickname(of uid: AccountUid) -> String? {
 		var profile = AccountProfile()
 		guard accountGetProfile(&profile, uid).succeeded else { return nil }
 		defer { accountProfileClose(&profile) }
 		var base = AccountProfileBase()
 		guard accountProfileGet(&profile, nil, &base).succeeded else { return nil }
-		let nickname = withUnsafeBytes(of: base.nickname) { rawPtr -> String in
-			let buffer = rawPtr.bindMemory(to: CChar.self)
-			return String(cString: buffer.baseAddress!)
-		}
+		// nickname is a fixed size char array, not always null terminated
+		let bytes = withUnsafeBytes(of: base.nickname) { raw in Array(raw.prefix { $0 != 0 }) }
+		let nickname = String(cStr: bytes + [0])
 		return nickname.isEmpty ? nil : nickname
 	}
 
-	/// Find the link for a given switch_uid, if any.
-	func linkFor(_ uid: String) -> Link? {
-		for link in links {
-			if link.switchUid == uid { return link }
-		}
-		return nil
+	func link(for uid: String) -> Link? {
+		links.first { $0.switchUid == uid }
 	}
-
-	// MARK: - Input
 
 	mutating func tick(_ ctx: inout RunLoopContext) {
 		// Handle exit request
@@ -179,158 +147,120 @@ struct Menu {
 			return
 		}
 
-		let count = entries.count + 1  // +1 for trailing "Exit app"
-
 		// Move selection
 		if ctx.pad.wasButtonPressed(.anyDown) {
 			self.wasInvalidated = true
-			selectedIndex = (selectedIndex + 1) % count
+			selectedIndex = (selectedIndex + 1) % rowCount
 		}
 		if ctx.pad.wasButtonPressed(.anyUp) {
 			self.wasInvalidated = true
-			selectedIndex = (selectedIndex - 1 + count) % count
+			selectedIndex = (selectedIndex - 1 + rowCount) % rowCount
 		}
 
-		// A: link/relink a profile, or exit on the trailing row
+		// A: link or relink, or exit on the last row
 		if ctx.pad.wasButtonPressed(.a) {
 			self.wasInvalidated = true
 			if selectedIndex < entries.count {
-				linkFlow(for: entries[selectedIndex], &ctx)
+				pair(entries[selectedIndex], &ctx)
 			} else {
 				ctx.exit()
 			}
 		}
 
-		// X: unlink a linked profile
-		if ctx.pad.wasButtonPressed(.x) {
-			if selectedIndex < entries.count {
-				let entry = entries[selectedIndex]
-				if linkFor(entry.uid) != nil {
-					self.wasInvalidated = true
-					unlink(entry)
-				}
+		// X: unlink
+		if ctx.pad.wasButtonPressed(.x), selectedIndex < entries.count {
+			let entry = entries[selectedIndex]
+			if link(for: entry.uid) != nil {
+				let removed = ProfileStore.removeLink(switchUid: entry.uid)
+				log(removed ? "Unlinked \(entry.nickname)" : "Couldn't update the profiles file on the SD card.")
+				reload()
 			}
 		}
 	}
 
-	// MARK: - Link flow
+	mutating func pair(_ entry: ProfileEntry, _ ctx: inout RunLoopContext) {
+		log("Asking Discord for a code...", rd: true)
+		consoleUpdate(nil)
 
-	mutating func linkFlow(for entry: ProfileEntry, _ ctx: inout RunLoopContext) {
-		//		 --- Start server ---
-		let serverWork: ThreadFunc = { conf in
-			App.server.start()
-			while true {
-				if !App.server.serveLoop() {
-					break
-				}
-				Thread.sleep(for: .microseconds(100))
-			}
-
-			// server stopped, maybe we got our data
-			webConfigRequestExit(&App.webConfig)
-			App.server.stop()  // the server is stopped but we can always just double check lmao
-			threadExit()
+		let device: Discord.DeviceAuthorization
+		do {
+			device = try App.discord.requestDeviceAuthorization()
+		} catch {
+			log("Failed: \(error.errorDescription ?? "Unknown error")")
+			return
 		}
-		var thread: Thread = .init()
-		// -----------------------------------
 
-		// Generate code challenge and state
-		let codeVerifierBytes = Crypto.randomBytes(count: 64) ?? []
-		let codeVerifier = Crypto.base64urlEncode(codeVerifierBytes)
-		let codeChallenge = Crypto.base64urlEncode(
-			Crypto.sha256([UInt8](codeVerifier.utf8))
-		)
-		let state = Crypto.hexEncode(Crypto.randomBytes(count: 16) ?? [])
-
-		let deviceIP = App.server.getIPAddress()
-
-		App.server.codeChallenge = codeChallenge
-		App.server.state = state
-		App.server.code = nil  // clear any stale code from a previous attempt
-
-		_ = threadCreate(&thread, serverWork, nil, nil, 0x4000, 0x3B, 2)
-		threadStart(&thread)
-
-		let url = "http://\(deviceIP):45601"
-
-		// Render an on-device QR code for the pairing URL, with the URL printed
-		// below as a fallback. (QRCode is owned by the QR agent.)
 		consoleClear()
 		print("\nLink \(entry.nickname) to Discord\n")
-		if let matrix = QRCode.encode(url) {
-			QRCode.render(matrix)
+		if let qr = QRCode.encode(device.verificationURL) {
+			// the console is 45 rows, leave 6 for the text
+			QRCode.render(qr, quietZone: max(1, min(4, (39 - qr.count) / 2)))
 		}
-		print("\nScan the QR code with your phone, or open this URL in a browser:\n")
-		print(url)
-		print("\nPress B to cancel.")
-		consoleUpdate(nil)  // push new frame
+		print("\nScan the QR code with your phone, or go to discord.com/activate")
+		print("on any device and enter \(device.userCode). Press B to cancel.")
+		consoleUpdate(nil)
 
-		// Wait for the pairing callback, but let the user cancel with B or time
-		// out, so the app never freezes if pairing is never completed.
-		var waitedMs = 0
-		let timeoutMs = 180_000  // 3 minutes
-		while App.server.isRunning {
+		// wall clock, the polls themselves take a while
+		let start = armGetSystemTick()
+		func elapsedMs() -> Int { Int(armTicksToNs(armGetSystemTick() - start) / 1_000_000) }
+
+		var auth: Discord.AuthResponse?
+		var intervalMs = max(device.interval, 1) * 1000
+		var nextPollMs = intervalMs
+		while auth == nil {
 			ctx.pad.update()
 			if ctx.pad.wasButtonPressed(.b) {
-				App.server.stop()
-				log("Pairing cancelled.", rd: true)
-				break
+				log("Linking cancelled.")
+				reload()
+				return
 			}
-			if waitedMs >= timeoutMs {
-				App.server.stop()
-				log("Pairing timed out.", rd: true)
-				break
+			if elapsedMs() >= device.expiresIn * 1000 {
+				log("The code expired, try again.")
+				reload()
+				return
 			}
-			Thread.sleep(for: .milliseconds(16))
-			waitedMs += 16
-		}
 
-		threadWaitForExit(&thread)
-		threadClose(&thread)  // cleanup
-
-		let dcode = App.server.code
-
-		// No code means the user cancelled or it timed out; just redraw.
-		guard dcode != nil else {
-			reload()
-			return
-		}
-		guard App.server.state == state else {
-			log("State mismatch, stopping...\n", rd: true)
-			return
-		}
-
-		log("\nReceived auth data, retrieving tokens...", rd: true)
-
-		if let code = dcode {
-			do {
-				try App.discord.authenticate(code: code, codeVerifier: codeVerifier)
-
-				let user = try App.discord.meUser()
-				let username = user.username.isEmpty ? "Unknown User" : user.username
-				log("Hello, \(username)!")
-
-				// upsert the link for the chosen switch_uid
-				if let token = App.discord.auth?.refreshToken {
-					let link = Link(
-						switchUid: entry.uid,
-						switchNickname: entry.nickname,
-						discordId: user.id,
-						discordUsername: username,
-						refreshToken: token
-					)
-					ProfileStore.upsert(link)
-					reload()
+			if elapsedMs() >= nextPollMs {
+				do {
+					switch try App.discord.pollDeviceToken(device) {
+					case .pending: break
+					case .slowDown: intervalMs += 5000
+					case .authorized(let token): auth = token
+					}
+				} catch {
+					// a dropped request is retried on the next poll, anything else ends it
+					guard case .requestError = error else {
+						log("Failed: \(error.errorDescription ?? "Unknown error")")
+						reload()
+						return
+					}
 				}
-			} catch {
-				log("Failed: \(error.errorDescription ?? "Unknown error")")
+				nextPollMs = elapsedMs() + intervalMs
 			}
-		}
-	}
 
-	mutating func unlink(_ entry: ProfileEntry) {
-		ProfileStore.removeLink(switchUid: entry.uid)
-		log("Unlinked \(entry.nickname)", rd: true)
+			Thread.sleep(for: .milliseconds(16))
+		}
+
+		guard let auth else { return }
+		log("Approved, fetching your Discord account...", rd: true)
+		consoleUpdate(nil)
+
+		do {
+			let user = try App.discord.meUser()
+			let username = user.username.isEmpty ? "Unknown User" : user.username
+			let saved = ProfileStore.upsert(
+				Link(
+					switchUid: entry.uid,
+					switchNickname: entry.nickname,
+					discordId: user.id,
+					discordUsername: username,
+					refreshToken: auth.refreshToken
+				)
+			)
+			log(saved ? "Linked \(entry.nickname) to \(username)!" : "Couldn't save the link to the SD card.")
+		} catch {
+			log("Failed: \(error.errorDescription ?? "Unknown error")")
+		}
 		reload()
 	}
 
@@ -343,25 +273,20 @@ struct Menu {
 extension Menu {
 	mutating func draw() {
 		print("\nSwitchRPC\n")
-		print("Select a profile, then press A to link Discord.\n")
+		print("Pick a profile and press A to link it to a Discord account.\n")
 
-		for (i, entry) in self.entries.enumerated() {
-			let selector = (i == self.selectedIndex) ? "-> " : "   "
+		for (i, entry) in entries.enumerated() {
+			let selector = (i == selectedIndex) ? "-> " : "   "
 			let status: String
-			if let link = linkFor(entry.uid), !link.discordUsername.isEmpty {
-				status = "Discord: \(link.discordUsername)"
-			} else if linkFor(entry.uid) != nil {
-				status = "Discord: linked"
+			if let link = link(for: entry.uid) {
+				status = link.discordUsername.isEmpty ? "linked" : link.discordUsername
 			} else {
 				status = "not linked"
 			}
 			print("  \(selector)\(entry.nickname)  [\(status)]")
 		}
-
-		// trailing "Exit app" row
-		let exitIndex = self.entries.count
-		let exitSelector = (self.selectedIndex == exitIndex) ? "-> " : "   "
-		print("  \(exitSelector)Exit app")
+		let selector = (selectedIndex == entries.count) ? "-> " : "   "
+		print("  \(selector)Exit app")
 
 		print("\n")
 		print("A: link/relink    X: unlink    +: exit")

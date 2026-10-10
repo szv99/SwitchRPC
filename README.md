@@ -5,19 +5,13 @@ Does not rely on anything other than your Switch and a mobile device for logging
 
 The rich presence is handled on the Switch itself, without the need for external tools on other computers.
 
-## Per-user Discord linking
+## Profiles
 
-Each Nintendo Switch user profile can be linked to its own Discord account. The config app lists every Switch profile (plus a "Default (all profiles)" entry for any profile that isn't linked individually) along with its current link status, so you can give each person on the console their own Discord identity.
+Every Switch user profile can be linked to its own Discord account. Presence goes to the account of whoever is playing, and moves over when a different user starts a game.
 
-When a game is running, the sysmodule looks up the currently-playing Switch user and pushes presence to **that** user's linked Discord account only. Presence is no longer mirrored to every linked account at once. Since the Switch only runs one application at a time, there is at most one active Discord session at a time, and the active Discord identity follows whichever Switch user is playing.
+There's also a Default link, used for any profile that isn't linked on its own. Leave it empty and unlinked profiles don't show any presence. Upgrading from an older version turns your existing login into the Default link, so nothing changes until you link profiles individually.
 
-If a profile has no link of its own, the Default link (if set) is used as a fallback. If neither exists, no presence is pushed for that user.
-
-In the config app:
-- Up/Down move between profiles.
-- A links a profile (or relinks one that is already linked).
-- X unlinks a linked profile.
-- Plus exits the app.
+In the config app, pick a profile and press A to link it (or relink it to another account), X to unlink it. Changes apply right away, no reboot needed.
 
 > [!TIP]
 > Like this project? Own a Mac for developing? You might like [XRPC, Xcode Rich Presence done right](https://github.com/llsc12/XRPC).
@@ -31,23 +25,16 @@ Relies on Nintendo's CDN for game artworks. Uses Discord Social SDK endpoints fo
 
 Written in Embedded Swift!
 
-## Pairing
-
-Linking a profile is done entirely on-device. When you start a link, the Switch renders a QR code directly on its own screen (no web applet, no external page) pointing at the Switch's local web server, e.g. `http://<switch_ip>:45601`. Scan it with your phone, or type the URL printed underneath the QR code as a fallback.
-
-Your phone opens the local page, which kicks off the Discord OAuth2 (PKCE) flow. Once you approve, Discord redirects back to the Switch's local web server with the code and state, the Switch exchanges the code for tokens, fetches your Discord id and username, and saves the link for the profile you chose.
-
 ## Privacy
 
-The OAuth2 process happens entirely between your Switch, your phone, and Discord. The QR code is generated and displayed locally on the Switch screen, so no external/static web page is involved in showing it.
+Linking uses Discord's device authorization flow, the same one consoles use. The config app asks Discord for a short code and shows it as a QR code (generated on the Switch) for `discord.com/activate`. Scan it with your phone, or type the code there on any device, and approve. Meanwhile the Switch polls Discord and receives the tokens once you've approved.
 
-The QR code (and its fallback URL) point to the Switch's own local web server on your network (`http://<switch_ip>:45601`). The Discord OAuth2 flow redirects the code and state back to that local address, which the Switch picks up to complete authentication. Discord refresh tokens are stored on the SD card per linked profile.
+Only the Switch, your phone and Discord are involved, there's no third party page, and your phone doesn't need to be on the same network.
 
-UPDATE: I think I switched this to cf pages
+Refresh tokens are stored per profile in `sdmc:/config/switchrpc_profiles.json` and are kept out of the sysmodule's log.
 
 ## Credits
 
-- NXGallery for the webserver implementation, very epic
 - libnx innit
 - also using libcurl libjson-c ykyk
 - switchpresence-rewritten with the process checking

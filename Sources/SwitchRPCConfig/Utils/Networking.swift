@@ -68,7 +68,7 @@ struct Request {
 		newRequest.data = data
 		return newRequest
 	}
-	func settingTimeout(ms timeout: Int) -> Request {
+	func settingTimeout(seconds timeout: Int) -> Request {
 		var newRequest = self
 		newRequest.timeout = timeout
 		return newRequest
@@ -92,7 +92,7 @@ struct Request {
 	mutating func setData(_ data: String) {
 		self.data = data
 	}
-	mutating func setTimeout(ms timeout: Int) {
+	mutating func setTimeout(seconds timeout: Int) {
 		self.timeout = timeout
 	}
 	mutating func setFollowRedirects(_ follow: Bool) {
